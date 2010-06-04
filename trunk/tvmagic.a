@@ -1,0 +1,678 @@
+;
+; TV MAGIC!
+;
+; Copyright(c) 2008 by Christopher Abad
+; aempirei@gmail.com
+;
+
+   list x=on,w=0,p=12f675
+   include "p12f675.inc"
+   __CONFIG _CPD_OFF & _CP_OFF & _BODEN_OFF & _MCLRE_OFF &_PWRTE_OFF & _WDT_OFF & _HS_OSC
+   radix dec
+
+   include "piclib.a"
+
+;
+; jump to main, which then is followed by configuration
+;
+
+   goto main
+
+;
+; code is written for a 16.00mhz clock, this should be easily changable to any clock >= 16mhz simply by changing
+; the configuration lines below (primarily just cpu_hz) this doesnt work correctly yet for some reason, probably
+; due to rounding and lack of performing ditering of scanline timing errors
+; please refer to the schematic in the README
+;
+
+cpu_mhz                 equ   .16
+cpu_hz                  equ   cpu_mhz * .1000000
+cycles_per_instruction  equ   .4
+cpmi                    equ   cycles_per_instruction * .1000000 ; cycles per million instructions
+cpu_ips                 equ   cpu_hz / cycles_per_instruction
+cpu_mips                equ   cpu_hz / cpmi
+round_up_hack           equ   cycles_per_instruction - .1
+
+scanline_hz             equ   .15748
+
+scanlines_per_field     equ   .240
+scanlines_per_vblank_bp equ   .13
+scanlines_per_frame     equ   (scanlines_per_field + scanlines_per_vblank_bp + .9) * .2 + 1  ; 525
+
+;
+; scanline time is calculated at 65.3 microseconds (denoted as 'us' henceforword)
+; ic means instruction count
+; H = 63.5us
+;
+
+ic_scanline             equ   cpu_hz / (scanline_hz * cycles_per_instruction)             ; 1.00*H ~ 63.50us
+ic_frontporch           equ   ic_scanline * .2 / .100                                     ; 0.02*H ~  1.27us
+ic_backporch            equ   ic_scanline * .8 / .100                                     ; 0.08*H ~  5.08us 
+ic_hsync                equ   ic_scanline * .8 / .100                                     ; 0.08*H ~  5.08us 
+ic_hdata                equ   (ic_scanline - ic_frontporch - ic_backporch - ic_hsync)     ; 0.82*H ~ 52.07us
+
+;
+; these values are confusing, ignore them for now because i really dont have the screen well defined
+;
+
+screen_width            equ   64 ; ic_scanline
+screen_height           equ   scanlines_per_field
+
+;
+;
+; the VSYNC/VBLANK period is the primary problem i have been having with implementing the NTSC driver
+; all online documentation is totally fucking bullshit and therefore i hope to come out of this
+; with what is essentially _THE_ reference implementation of shitty NTSC drivers for 8-BIT pics.
+; im by no means the first person to do this, but hopefully i explain it the best and provide decent
+; example code.
+;
+; VBLANK period appears to consist of 9 scanlines (9.00*H ~ 571.5us) worth of sync+equalization pulses
+; and another 13 scanlines (825.5us) for the VBLANK back porch and an additional half-scanline (31.75us)
+; for a total of 22.5*H ~ 1428.75us
+;
+; there are first 3 pulse intervals each for a duration of 3.00*H ~ 190.5us at twice the scanline rate
+;   1) pre-equalizing pulse interval   - 6 total pulses over 3.00*H ~ 192.5us for 31.75us per pulse ON/OFF
+;   2) vertical sync pulse interval    - 6 total pulses over 3.00*H ~ 192.5us for 31.75us per pulse OFF/ON
+;   3) post-equalizing pulse interval  - 6 total pulses over 3.00*H ~ 192.5us for 31.75us per pulse ON/OFF
+;
+; secondly, there are 13 blank scanlines with normal HSYNC pulses
+; this is sometimes called the 'vertical back porch'
+;
+; finally, odd frames end with a half-scanline, which i simply blank, similar to the vblank back porch scanlines
+; and even frames extend the final post-equalization pulse with a half-scanline of voltage at black (0.3V)
+; half a scanline is about 0.50*H ~ 31.75us
+;
+
+ic_half_scanline         equ   (ic_scanline / 2)                                             ; ~ 31.75us
+ic_half_scanline_hdata   equ   (ic_half_scanline - ic_frontporch - ic_backporch - ic_hsync)  ; ~ 21.75us
+ic_equalizing_duty_off   equ   (.250 * cpu_hz) / (cpmi * .100)                               ; ~  2.50us
+ic_equalizing_duty_on    equ   (ic_half_scanline - ic_equalizing_duty_off)                   ; ~ 29.25us
+ic_vsync_duty_on         equ   (.250 * cpu_hz) / (cpmi * .100)                               ; ~  2.50us
+ic_vsync_duty_off        equ   (ic_half_scanline - ic_vsync_duty_on)                         ; ~ 27.25us
+
+;
+; since theres no move literal to F
+; i pre-populate some file registers with the proper GPIO states
+;
+
+TV0_0       equ   B'000001'      ; for voltage = 0.0v
+TV0_3       equ   B'000101'      ; for voltage = 0.3v at GP2
+TV1_0       equ   B'000011'      ; for voltage = 1.0v at GP1
+TV1_3       equ   B'000111'      ; for voltage = 1.3v at GP1+GP2 (maybe)
+
+;
+; a parity value that determines if execution is on an even or odd field
+;
+
+parity_fr      equ   0x20
+waitl_fr       equ   0x21
+hcounter_fr    equ   0x22
+vcounter_fr    equ   0x23
+velocity_fr    equ   0x24
+xleft_fr       equ   0x26
+xright_fr      equ   0x27
+tmp            equ   0x28
+
+velocity_mask  equ   B'00000001'
+
+;
+; wait3l timing macro
+; a timing macro that can wait _ANY_ amount of instructions restricted by program memory
+; and stack recursion required by the preprocessor
+;
+
+wait3l macro count
+   if count > .770
+      wait3l (count - .770)
+      wait2l .770
+   else
+      wait2l count
+   endif      
+   endm   
+
+;
+;
+; wait2l timing macro
+; a timing macro that is a composite of the waitl and nopsl macros
+; can perform exact timings of any instruction count in the range [0,770]
+;
+;
+
+wait2l macro count
+
+   local wait_param = (count - 5) / 3
+   local nops_param = count - (wait_param * 3 + 5)
+
+   if count >= 5   
+      waitl wait_param
+
+      if nops_param > 0
+         nopsl nops_param
+      endif
+   else
+      nopsl count
+   endif
+
+   endm
+
+;
+;
+; waitl timing macro
+; a timing macro that waits for 3*W + 5 instructions in the range of [8,770] with formula WAIT(N) = 3*N+5
+; where N is [1,255]
+; 
+;
+
+waitl macro cycles      ; = 3*W + 5
+   movlw cycles         ; 1
+   call delay           ; 3*W + 4
+   endm
+
+waitf macro f           ; 3*W + 5
+   movf f, W            ; 1
+   call delay           ; 3*W + 4
+   endm
+
+delay:                  ; = 3*W + 2
+   movwf waitl_fr       ; 1
+
+delay_L1:               ; = 3*W - 1
+   decfsz waitl_fr, F   ; 1(2)
+   goto delay_L1        ; 2
+
+   return               ; 2
+
+;
+; nop timing macro
+; used for exact instruction count timing, when the wait macro cant get the exact timing
+; quite a waste of instructions. it can time _ANY_ amount of time restricted by memory
+; and stack recursion required by preprocessor
+;
+
+nopsl macro count
+   if (count > 1)
+      nopsl (count >> 1)
+      nopsl (count >> 1)
+   endif
+   if (count & 1)
+      nop
+   endif
+   endm
+
+;
+;
+; macros for setting the TV video voltage, each of which takes 2 instructions
+; with the exception of voltage_0_fast and voltage_invert_fast which take 1 instruction each
+; the caveat to the voltage_*_fast macros is that they affect all IO pins, not only
+; the ones related to NTSC out. the inversion pairs with respect to voltage is
+; (black, white) and (0, hiwhite)
+;
+
+voltage_0_fast macro
+   clrf GPIO
+   endm
+
+voltage_invert_fast macro
+   comf GPIO, F
+   endm
+
+voltage_0 macro
+   movlw TV0_0
+   movwf GPIO
+   endm
+   
+voltage_black macro
+   movlw TV0_3
+   movwf GPIO
+   endm
+
+voltage_white macro
+   movlw TV1_0
+   movwf GPIO
+   endm
+
+voltage_hiwhite macro
+   movlw TV1_3
+   movwf GPIO
+   endm
+
+;
+;
+; woo, main!
+;
+;
+
+main:
+
+   bcf STATUS, RP0   ; select bank 0
+   clrf GPIO
+   movlw 0x07
+   movwf CMCON
+
+   bsf STATUS, RP0   ; select bank 1
+
+   clrf ANSEL        ; clear the analog input selector
+   clrf TRISIO       ; set all general i/o to output
+
+   bcf STATUS, RP0   ; select bank 0
+
+   movlw scanlines_per_field
+   movwf hcounter_fr
+
+   movlw scanlines_per_vblank_bp
+   movwf vcounter_fr
+
+   ;
+   ; initialize ball position
+   ;
+
+   movlf .23, px
+   movlf .23, py
+   movlf .22, x
+   movlf .22, y
+
+   ;
+   ; start out at an odd field:
+   ; if parity is non-zero then field is odd
+   ; if parity is zero then field is even
+   ;
+
+   movlw .0
+   movwf parity_fr
+   comf parity_fr, F
+
+ntsc:
+
+   voltage_black
+
+front_porch:               ; 1.25us -- including pre-amble / loop
+
+   nopsl .3
+
+front_porch_L1:
+
+   wait2l ic_frontporch - .2 - .3
+
+   voltage_0
+
+hsync:                     ; 5.00us (20)
+
+   nop
+   nop
+
+hsync_L2:
+
+   wait2l ic_hsync - .4
+   voltage_black
+
+back_porch:                ; 3.75us (15)
+
+   wait2l ic_backporch - .12
+
+   movf x, W
+   movwf xleft_fr
+   sublw screen_width      ; it must be that screen_width - xleft_fr > 0
+   movwf xright_fr
+   incf xleft_fr, F        ; hack for delayf .0
+
+   ; (5)
+
+   ;
+   ; i possibly have time to select if its a draw line or a blank line, luckily i count the row in vcounter_fr
+   ;
+
+   cmpffe hcounter_fr, y   ; 2
+
+   ; (2)
+
+   btfsc STATUS, Z         ; 1(2) fall-thru when not at ball line
+   goto bp_L1              ; 2(0)
+
+   voltage_black           ; 0(1)
+
+   goto bp_L2              ; 0(2)
+
+bp_L1:
+
+   voltage_white           ; 1(0)
+   nop                     ; 1(0)
+
+bp_L2:
+
+hdata:                     ; 53.5us (214)
+
+   ;
+   ; my waitf has a caveat is that it cant really delay a wait of 0, dont even try passing 0 to it
+   ;
+
+   waitf xleft_fr          ; 3*(W+1)+5
+   voltage_invert_fast     ; 1
+   nop                     ; 1
+   voltage_invert_fast     ; 1
+   waitf xright_fr         ; 3*(SW-W) + 5
+
+   ; 3(screen_width - 1) + 10 + 3
+
+   wait2l ic_hdata - .2 - (.3 * screen_width) - .13 - .3
+   ; wait2l ic_hdata - .2
+
+   voltage_black
+
+   ; front porch pre-amble (3/2)
+
+   decfsz hcounter_fr, F   ; 1(2)
+   goto front_porch_L1     ; 2(0)
+
+;
+; when code falls through here, front-porch signal is 0.50us in at voltage_black (0.3v)
+; vcount expects to be preloaded with the value of scanlines_per_vblank_bp
+; depending on parity. odd fields should send a half-scanline
+;
+
+odd_field_half_scanline:
+
+   btfss parity_fr, F      ; 1(2)
+   goto vblank             ; 2(0)
+
+   ;
+   ; if code gets here, then the front porch has been 4 instructions so far, switch voltage to 0 by 1.25us
+   ;
+
+; front porch final -- 1.25us (including pre-amble and parity branch)
+
+   wait2l ic_frontporch - .4 - .1
+
+   voltage_0_fast
+
+; hsync -- 5.00us (20)
+
+   wait2l ic_hsync - .2
+   voltage_black
+
+;back_porch -- 3.75us (15)
+
+   wait2l ic_backporch - .2
+   voltage_black
+
+; half-scanline -- 21.75us (87)
+
+   wait2l ic_half_scanline_hdata - .2
+   voltage_black
+
+; first pre-equalization pulse pre-amble / branch merge alignment
+
+   wait2l .5
+
+vblank:
+
+;
+; at this point the first equalization pulse is in by 5 instructions
+;
+
+pre_equalizing_pulse_interval:            ; 3.00*H ~ 190.5us (6 pulses)
+
+   ;
+   ; the first equalizing pulse begins late (by 0.5us) therefore i cannot use the macro 
+   ; additionally, the parity needs to be toggled once during each VBLANK period to keep track of odd/even field info
+   ; this expects a black voltage level (0.3V)
+   ;
+
+   wait2l ic_equalizing_duty_on - .4 - .38 - .5    ; 29.25us (117) -- including voltage_black and pre-amble from above
+
+   comf parity_fr, F                      ; 1
+
+   incf velocity_fr, F                    ; 1
+   movlw velocity_mask                    ; 1
+   andwf velocity_fr, W                   ; 1
+
+   btfss STATUS, Z                        ; 1(2)
+   goto vsync_velocity_L1                 ; 2(0)
+   call step_ball_fn                      ; 0(36)
+   goto vsync_tardy_L1                    ; 0(2)
+
+vsync_velocity_L1:
+
+   wait2l .35
+
+vsync_tardy_L1:
+
+   voltage_0
+
+   wait2l ic_equalizing_duty_off - .4     ; 2.5us (10) -- including voltage_0 and front porch pre-amble from above
+   movlw scanlines_per_vblank_bp
+   movwf vcounter_fr
+   voltage_black
+
+;
+; the equalizing_pulse macro, which i've placed inline instead of at the top of this file since
+; this is the only place that it occurs.
+;
+
+equalizing_pulse macro voltage_param
+   wait2l ic_equalizing_duty_on - .2      ; 29.25us (117) -- including voltage_black
+   voltage_0
+   wait2l ic_equalizing_duty_off - .2     ; 2.5us (10) -- including voltage_0 and front porch pre-amble from above
+   voltage_param
+   endm
+
+   ;
+   ; the remaining five equalizing pulses i can use the macro
+   ;
+
+   equalizing_pulse voltage_black
+   equalizing_pulse voltage_black
+   equalizing_pulse voltage_black
+   equalizing_pulse voltage_black
+   equalizing_pulse voltage_0
+
+vsync_pulse_interval:                     ; 3.00*H ~ 190.5us (6 pulses)
+
+vsync_pulse macro voltage_param
+   wait2l ic_vsync_duty_off - .2    ; 29.25us -- including voltage_0 and front porch pre-amble from above
+   voltage_black
+   wait2l ic_vsync_duty_on - .2     ; 2.50us (10) -- including voltage_black
+   voltage_param
+   endm
+
+   vsync_pulse voltage_0
+   vsync_pulse voltage_0
+   vsync_pulse voltage_0
+   vsync_pulse voltage_0
+   vsync_pulse voltage_0
+   vsync_pulse voltage_black
+
+post_equalizing_pulse_interval:            ; 3.00*H ~ 190.5us (6 pulses)
+  
+   equalizing_pulse voltage_black
+   equalizing_pulse voltage_black
+   equalizing_pulse voltage_black
+   equalizing_pulse voltage_black
+   equalizing_pulse voltage_black
+   equalizing_pulse voltage_black
+
+even_field_half_scanline:
+
+   ;
+   ; this adds 3 instructions to the VBLANK back porch first scanline's front porch
+   ; otherwise it adds 2 instructions to the even field half-scanline
+   ;
+
+   btfsc parity_fr, F      ; 1(2)
+   goto vblank_back_porch  ; 2(0)
+
+   ;
+   ; this half-scanline is simple, it expects voltage to be at black (0.3V) and it should just last for about 31.75us
+   ; including the branch condition above (which is 2 instructions) and it doesnt need to exit at a different level
+   ;
+
+   wait2l ic_half_scanline - .2
+
+vblank_back_porch_preamble:   
+
+   ; VBLANK back porch pre-amble / branch merge alignment
+
+
+   nopsl .3
+
+;
+;
+; vblank_back_porch expects to come in at voltage_black, and the number of scanlines to generate is stored
+; in vcounter_fr. the scanlines should appear identical to visible scanlines except blank in the hdata section
+; the pre-amble to this VBLANK back porch first scanline's front porch is 3 instructions regardless if the 
+; half-scanline is generated or not
+;
+;
+
+vblank_back_porch:   
+
+vblank_black_porch_front_porch:
+
+   ;
+   ; front_porch is 1.25us including vblank_back_porch_L1 and above preamble and therefore
+   ; no code other than the voltage toggle is needed
+   ;
+
+vblank_back_porch_L1:                  ; 0.50us minus 3 instructions
+
+   wait2l ic_frontporch - .3 - .2
+   voltage_0
+
+; hsync -- 5.00us
+
+   wait2l ic_hsync - .2
+   voltage_black
+
+; back_porch -- 3.75us
+
+   wait2l ic_backporch 
+
+; hdata -- 53.5us (214)
+
+   wait2l ic_hdata - .2
+
+   ;
+   ; setup the hcounter_fr for the number of vertical back porch scanlines every vblank back porch scanline
+   ;
+
+   movlw scanlines_per_field  ; 1
+   movwf hcounter_fr          ; 1
+
+   ; front porch pre-amble 3 instructions or 2 instructions
+
+   decfsz vcounter_fr, F      ; 1(2)
+   goto vblank_back_porch_L1  ; 2(0)
+
+   ;
+   ;
+   ; perform the first front porch for the first scanline back into visible data, then jump into the HSYNC
+   ;
+   ;
+
+   wait2l ic_frontporch - .4
+
+   voltage_0                  ; 2
+   goto hsync_L2              ; 2
+
+;
+;
+; i dont have the skills to pull off what i thought would have been much simpler to program
+; so im opting for the stupid bouncy ball shit
+;
+;
+
+x     equ   0x30
+y     equ   0x31
+px    equ   0x32
+py    equ   0x33
+dx    equ   0x34
+dy    equ   0x35
+
+step_ball_fn:        ; (36)
+
+   ;
+   ; do X
+   ;
+
+   movf  px, W                   ; (1)
+   subwf x, W                    ; (1)
+   addwf x, W                    ; (1) Xn+1 = x + dx = x + (x - px) = 2x - px
+
+   andlw B'00111111'             ; boundry hack for X
+   movwf dx                      ; (1) begin swapping x = Xn+1, px = x
+
+   ; (5)
+
+   ;
+   ; test for boundry condition of X
+   ;
+
+   movff x, px                   ; (2)
+   movff dx, x                   ; (2) sum = 12
+
+   ; (4)
+
+   ;
+   ; do Y
+   ;
+
+   movf  py, W                   ; (1)
+   subwf y, W                    ; (1)
+   addwf y, W                    ; (1) Yn+1 = y + dy = x + (y - py) = 2y - py
+
+   andlw B'01111111'             ; boundry hack for Y
+   movwf dy                      ; (1) begin swapping y = Yn+1, py = y
+
+   ; (5)
+
+   ;
+   ; test for boundry condition of Y
+   ;
+
+   movff y, py                   ; 2
+   movff dy, y                   ; 2
+
+   ; (4)
+
+   ;
+   ; test x,y == 0 then swap px/x and py/y for bouncing effect
+   ;
+
+   movf x, F            ; 1
+
+   btfss STATUS, Z      ; 1(2)
+
+   goto bounce_X_L1     ; 2(0)
+
+   movff px, x          ; 0(2)
+   clrf px              ; 0(1)
+   goto bounce_X_L2     ; 0(2)
+
+bounce_X_L1:
+   
+   nopsl .4             ; 4(0)
+
+bounce_X_L2:
+   
+   ; (8)
+
+   movf y, F            ; 1
+
+   btfss STATUS, Z      ; 1(2)
+
+   goto bounce_Y_L1     ; 2(0)
+
+   movff py, y          ; 0(2)
+   clrf py              ; 0(1)
+   goto bounce_Y_L2     ; 0(2)
+
+bounce_Y_L1:
+   
+   nopsl .4             ; 4(0)
+
+bounce_Y_L2:
+   
+   ; (8)
+
+   return                        ; 2
+
+   end
