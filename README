@@ -66,13 +66,13 @@ higher, relative to audio) a scope helps immensely. beyond that obvious hint,
 ive noticed that newer TVs process the analog NTSC input digitally and try to do
 its best to display the input, or not display it at all, so they can be
 relatively picky.  if you are just getting a blue screen (or whatever color your
-inputs are on your tv by default) then try replacing the R1 and R2 with some 10K
-potentiometers set up as variable resistors or voltage dividers, either way
-really, and then tune the nobs until you get a working TV signal. if you get a
-black screen when your screen is normally blue, you are at least on the right
-track. sometimes the TV is really picky about the ratios between sync voltage,
-black (darkest visible) voltage, and white (brightest visible) voltage, esp.
-around the VBLANK periods and the back porch of horizontal scanlines.
+inputs are on your tv by default) then try replacing the R1 and R2 with a >= 1K
+potentiometer set up as a voltage dividers across pins 5 & 6 with center-tap
+being RCA out and then tune the nobs until you get a working TV signal. if you
+get a black screen when your screen is normally blue, you are at least on the
+right track. sometimes the TV is really picky about the ratios between sync
+voltage, black (darkest visible) voltage, and white (brightest visible) voltage,
+esp.  around the VBLANK periods and the back porch of horizontal scanlines.
 
 thanks,
 aempirei
