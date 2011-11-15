@@ -61,8 +61,8 @@ just do:
 
 some debugging hints are as follows:
 
-first and foremost, dealing with this kinda higher frequency singals, (at least
-higher, relative to audio) a scope helps immensely. beyond that obvious hint.
+first and foremost, dealing with these kinda higher frequency singals, (at least
+higher, relative to audio) a scope helps immensely. beyond that obvious hint,
 ive noticed that newer TVs process the analog NTSC input digitally and try to do
 its best to display the input, or not display it at all, so they can be
 relatively picky.  if you are just getting a blue screen (or whatever color your
