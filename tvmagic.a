@@ -40,7 +40,7 @@ scanlines_per_vblank_bp equ   .13
 scanlines_per_frame     equ   (scanlines_per_field + scanlines_per_vblank_bp + .9) * .2 + 1  ; 525
 
 ;
-; scanline time is calculated at 65.3 microseconds (denoted as 'us' henceforword)
+; scanline time is calculated at 63.5 microseconds (denoted as 'us' henceforword)
 ; ic means instruction count
 ; H = 63.5us
 ;
